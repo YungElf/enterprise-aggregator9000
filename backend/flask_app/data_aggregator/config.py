@@ -1,8 +1,29 @@
+# backend/flask_app/data_aggregator/config.py
 from dataclasses import dataclass
+from pathlib import Path
 import os
+
 from dotenv import load_dotenv
 
-load_dotenv()  
+# --- Load .env from root OR backend ---
+def _load_env_once():
+    here = Path(__file__).resolve()
+    backend_dir = here.parent.parent.parent          # .../backend
+    root_dir = backend_dir.parent                    # repo root
+
+    candidates = [
+        root_dir / ".env",       # if you run: python -m backend.flask_app...
+        backend_dir / ".env",    # if you run inside backend/
+    ]
+    for p in candidates:
+        if p.is_file():
+            load_dotenv(dotenv_path=str(p), override=False)
+            os.environ.setdefault("__ENV_LOADED_FROM__", str(p))
+            return
+    # fallback to default search (current CWD)
+    load_dotenv()
+
+_load_env_once()
 
 @dataclass(frozen=True)
 class Settings:
@@ -19,14 +40,13 @@ class Settings:
 def _req(name: str) -> str:
     v = os.getenv(name)
     if not v:
-        raise RuntimeError(f"Missing env var: {name}")
+        where = os.getenv("__ENV_LOADED_FROM__", "CWD/.env (auto)")
+        raise RuntimeError(f"Missing env var: {name} (loaded from {where})")
     return v
 
 def _bool(name: str, default: bool) -> bool:
     v = os.getenv(name)
-    if v is None:
-        return default
-    return v.strip().lower() in ("1","true","t","yes","y")
+    return default if v is None else v.strip().lower() in {"1","true","t","yes","y"}
 
 def load_settings() -> Settings:
     return Settings(

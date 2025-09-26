@@ -1,0 +1,203 @@
+import logging
+import re
+from typing import Any, List
+
+from apigee.apigee_api import ApigeeManagement
+
+from flask_app.web.utils.vault_utils import get_env_value
+from flask_app.web.constants import SSL_BUCKETS, SECURITY_POLICY_BUCKETS, APIGEE_SECURITY_TYPES, APIGEE_OAUTH, \
+    VERIFY_API_KEY, IP_ALLOW_LIST, APIGEE_SSL_TYPES, NONE, APIGEE_CORS, APIGEE_PROTECTION_DICT, REPORT_CELL_TRUE, \
+    REPORT_CELL_FALSE
+from flask_app.web.utils import safe_open_xml_list
+
+log = logging.getLogger()
+
+
+def handle_apigee_creds():
+    return get_env_value('APIGEE_USERNAME'), get_env_value('APIGEE_PASSWORD')
+
+
+def initialize_apigee_obj(planet, org, selected_env):
+    username, password = handle_apigee_creds()
+    planet_obj = selected_env.get_planet(planet)
+    return ApigeeManagement(selected_env, planet_obj, planet_obj.get_org(org), username=username,
+                            password=password)
+
+
+def get_all_active_proxies_by_deployment_env(all_info: dict, deployment_env: str) -> list[tuple[str, str]]:
+    env_info = [x for x in all_info['environment'] if x['name'] == deployment_env][0]
+    all_active_proxies = []
+
+    for proxy in env_info['aPIProxy']:
+        deployed_revisions = [rev['name'] for rev in proxy['revision'] if rev['state'] == 'deployed']
+        for revision in deployed_revisions:
+            all_active_proxies.append((proxy['name'], revision))
+
+    if not all_active_proxies:
+        log.warning(f"No proxies found in the selected environment: {deployment_env}")
+        return []
+
+    return all_active_proxies
+
+
+def fetch_apigee_xml_data(apigee_obj, proxy_name: str, revision: str) -> tuple[dict, dict]:
+    try:
+        policies = apigee_obj.proxy.get_policies_summary_for_proxy_revision(proxy_name, revision)
+        used_policies, virtual_hosts, xml_dicts = parse_apigee_xml_data(apigee_obj, policies, proxy_name, revision)
+        target_details = find_proxy_target_details(apigee_obj, proxy_name, revision)
+        output_json = {
+            "policies": used_policies,
+            "virtual_hosts": list(virtual_hosts),
+            "targets": target_details
+        }
+    except Exception as e:
+        log.error(f"Error with {proxy_name} - {revision}: {e}")
+        output_json = {
+            "policies": [],
+            "virtual_hosts": [],
+            "targets": []
+        }
+        xml_dicts = {}
+    return output_json, xml_dicts
+
+
+def parse_apigee_xml_data(apigee: ApigeeManagement, policies: list[dict], proxy: str,
+                          revision: str) -> tuple[list[dict], set[Any], dict]:
+    flow_policies = []
+    used_policies = []
+    virtual_hosts = []
+    xml_dict = {}
+
+    for api_proxy in apigee.proxy.get_proxy_endpoints(proxy, revision):
+        xmldict = apigee.proxy.get_proxy_endpoint_details(proxy, revision, api_proxy)
+
+        global_policies = [step['Step']['name'] for step in
+                           safe_open_xml_list(xmldict.get('preFlow', {}), ['request', 'children']) if 'preFlow' in xmldict]
+        flows = safe_open_xml_list(xmldict['flows'], []) if 'flows' in xmldict and xmldict['flows'] else []
+        for flow in flows:
+            if 'request' not in flow or not flow['request'] or 'children' not in flow['request']:
+                continue
+            steps = safe_open_xml_list(flow['request'], ['children'])
+            flow_policies = [*flow_policies, *[step['Step']['name'] for step in steps]]
+        for policy in policies:
+            if policy['policy_file_name'] in global_policies:
+                policy['application_level'] = 'global'
+                used_policies.append(policy)
+            if policy['policy_file_name'] in flow_policies:
+                policy['application_level'] = 'flow'
+                used_policies.append(policy)
+        proxy_virtual_hosts = xmldict['connection']['virtualHost'] if 'connection' in xmldict and 'virtualHost' in \
+                                                                      xmldict['connection'] else []
+        virtual_hosts = [*virtual_hosts, *proxy_virtual_hosts]
+        xml_dict[api_proxy] = xmldict
+
+    return used_policies, set(virtual_hosts), xml_dict
+
+
+def find_proxy_target_details(apigee: ApigeeManagement, proxy: str, revision: str) -> List[dict]:
+    target_details = {}
+    for target in apigee.proxy.get_proxy_targets(proxy, revision):
+        raw_details = apigee.proxy.get_proxy_target_by_name(proxy, revision, target)
+        target_details[target] = {
+            "url": raw_details['connection']['uRL'] if 'uRL' in raw_details['connection'] else 'N/A',
+            "ssl_info": raw_details['connection']['sSLInfo'] if 'sSLInfo' in raw_details['connection'] else None,
+        }
+    return target_details
+
+
+def identify_rate_limit(policies):
+    for policy in policies:
+        if policy['policy_type'] == 'SpikeArrest' and policy['rate_limit']:
+            return policy['rate_limit']
+    return None
+
+
+def identify_threat_protections(policies):
+    policy_types = [policy['policy_type'] for policy in policies]
+    output = [REPORT_CELL_TRUE if protection in policy_types else REPORT_CELL_FALSE for protection in
+              list(APIGEE_PROTECTION_DICT.values())]
+    return output
+
+
+def get_virtual_host_analysis_dict(virtual_host_data) -> List[str]:
+    host_types = sort_virtual_hosts(virtual_host_data)
+    ssl_bool_list = [REPORT_CELL_TRUE if ssl_type in host_types else REPORT_CELL_FALSE for ssl_type in sorted(list(APIGEE_SSL_TYPES))]
+    return ssl_bool_list
+
+
+def get_policy_analysis_dict(policy_data) -> List[str]:
+    used_security_types = identity_security_policies(policy_data)
+    rate_limit = identify_rate_limit(policy_data)
+    threat_protections = identify_threat_protections(policy_data)
+
+    security_bool_list = [REPORT_CELL_TRUE if security_type in used_security_types else REPORT_CELL_FALSE for security_type in
+                          sorted(list(APIGEE_SECURITY_TYPES))]
+
+    return [*security_bool_list, rate_limit, *threat_protections]
+
+
+def all_policies_disabled(policies):
+    return all(str(policy['enabled']).lower() == 'false' for policy in policies)
+
+
+def format_callout_url(policy):
+    callout_url = policy['callout_url']
+    callout_url = re.sub(r'127\.0\.0\.1:(\d*)\/', 'localhost/', str(callout_url))
+    callout_url = re.sub('localhost:(\d*)\/', 'localhost/', str(callout_url))
+    policy['callout_url'] = callout_url
+
+
+def identity_security_policies(policies):
+    used_security_types = []
+
+    # if not policies or len(policies) == 0 or all_policies_disabled(policies):
+    #     used_security_types.append(NONE)
+    for policy in policies:
+        format_callout_url(policy)
+        if policy['enabled'] == 'false':
+            continue
+        if policy['cors_policy'] and str(policy['cors_policy']).lower() != "none":
+            used_security_types.append(APIGEE_CORS)
+        for security_type in APIGEE_SECURITY_TYPES:
+            if security_type == NONE:
+                continue
+            elif (security_type == APIGEE_OAUTH and check_for_oauth2(policy)) or \
+                    (security_type == VERIFY_API_KEY and policy['api_key'] and policy['api_key'].lower() != "none") \
+                    or security_type == IP_ALLOW_LIST and policy['ip_allow_list'] != []:
+                used_security_types.append(security_type)
+            else:
+                check_for_security_type(**SECURITY_POLICY_BUCKETS[security_type], policy=policy,
+                                        security_type=security_type, used_security_types=used_security_types)
+    return list(set(used_security_types))
+
+
+def sort_virtual_hosts(virtual_hosts):
+    host_types = set()
+    all_hosts_in_buckets = {host for ssl_type in SSL_BUCKETS for host in SSL_BUCKETS[ssl_type]['hosts']}
+    for virtual_host in virtual_hosts:
+        for ssl_type in SSL_BUCKETS:
+            if virtual_host in SSL_BUCKETS[ssl_type]['hosts']:
+                host_types.add(ssl_type)
+                break
+        if virtual_host not in all_hosts_in_buckets:
+            log.error(f"{virtual_host} not found in buckets")
+    return host_types
+
+
+def check_uri_prefixes(callout_url, callout_urls):
+    for url in callout_urls:
+        if callout_url.startswith(url):
+            return True
+    return False
+
+
+def check_for_security_type(callout_urls: list[str], shared_flow_bundles: list[str], policy, security_type: str,
+                            used_security_types: list[str]):
+    if policy['shared_flow_bundle'] in shared_flow_bundles or check_uri_prefixes(policy['callout_url'], callout_urls):
+        used_security_types.append(security_type)
+
+
+def check_for_oauth2(policy):
+    if not policy['policy_name']:
+        return False
+    return '_oauth2_' in policy['policy_name'].lower() and policy['callout_url'] == 'None' and not policy['api_key']

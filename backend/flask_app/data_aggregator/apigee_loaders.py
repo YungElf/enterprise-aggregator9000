@@ -7,6 +7,7 @@ import os
 import time
 import requests
 
+# ---- Your constants & helpers ----
 from .utils.apigee_constants import ENV_OBJ_DICT, SPLUNK_API_BY_ENV
 from .utils.apigee_utils import (
     initialize_apigee_obj,
@@ -15,17 +16,13 @@ from .utils.apigee_utils import (
     get_virtual_host_analysis_dict,
 )
 
-# ----------------------- Small helpers -----------------------
+# ====================== Small helpers ======================
 
 def _security_mechanism(policy_summary: Dict[str, Any], ssl_flags: Dict[str, Any]) -> str:
-    if policy_summary.get("oauthv2"):
-        return "oauth2"
-    if policy_summary.get("verify_api_key"):
-        return "apikey"
-    if policy_summary.get("hmac"):
-        return "hmac"
-    if any(ssl_flags.get(k) for k in ("clientAuthRequired", "twoWaySSL", "mtls")):
-        return "mtls"
+    if policy_summary.get("oauthv2"): return "oauth2"
+    if policy_summary.get("verify_api_key"): return "apikey"
+    if policy_summary.get("hmac"): return "hmac"
+    if any(ssl_flags.get(k) for k in ("clientAuthRequired", "twoWaySSL", "mtls")): return "mtls"
     return "unknown" if any([policy_summary.get("oauthv2"), policy_summary.get("verify_api_key"), policy_summary.get("hmac")]) else "none"
 
 def _first_target_host(targets: Optional[List[Dict[str, Any]]]) -> str:
@@ -50,88 +47,121 @@ def _phoenix_month(val: str) -> str:
     phx = dt.astimezone(ZoneInfo("America/Phoenix"))
     return f"{phx.year:04d}-{phx.month:02d}-01"
 
-# ----------------------- Splunk plumbing -----------------------
+# ====================== Splunk plumbing ======================
 
-def _resolve_splunk_host(env_key: str, explicit_host: str) -> str:
+def _resolve_splunk_host_for_env(env_key: str, explicit_host: str) -> str:
     """
     Returns full base like 'https://host:443' or 'https://host:8089'
-    Priority: explicit .env SPLUNK_HOST -> constants SPLUNK_API_BY_ENV
+    Priority: explicit .env SPLUNK_HOST -> constants SPLUNK_API_BY_ENV[env_key]
     """
     host = (explicit_host or "").strip()
     if host:
-        return host
+        return host  # e.g., https://insightssplunkapi.aexp.com:443
+
+    # constants dict keys are 'E1','E2','E3' — normalize
     cfg = SPLUNK_API_BY_ENV.get(env_key.upper())
     if not cfg:
-        raise RuntimeError(f"No SPLUNK_HOST and no SPLUNK_API_BY_ENV for env '{env_key}'")
+        raise RuntimeError(f"No SPLUNK_HOST provided and no SPLUNK_API_BY_ENV mapping for env '{env_key}'")
+
     scheme = cfg.get("scheme", "https")
     hostname = cfg["host"]
-    port = cfg.get("port", 443)  # default to 443 for corp deployments
+    # default to 443 if port missing; otherwise use mapped port (8089 / 12011 / etc.)
+    port = cfg.get("port", 443)
     return f"{scheme}://{hostname}:{port}"
 
-def _splunk_base(host: str) -> str:
+def _splunk_bases(host: str) -> List[str]:
     """
-    Mgmt port 8089 uses /services
-    Web port 443 proxies REST under /splunkd/__raw/services
+    Try in order:
+      1) API VIP native REST (/services)
+      2) UI VIP raw proxy (/splunkd/__raw/services)
+      3) UI VIP locale+raw proxy (/en-US/splunkd/__raw/services)
+    The code auto-detects JSON vs HTML and falls back.
     """
-    if host.endswith(":443"):
-        return f"{host}/splunkd/__raw/services"
-    return f"{host}/services"
+    return [f"{host}/services", f"{host}/splunkd/__raw/services", f"{host}/en-US/splunkd/__raw/services"]
 
 def _run_splunk(host: str, user: str, pwd: str, query: str, verify_tls: bool = True) -> List[Dict[str, Any]]:
-    base = _splunk_base(host)
-    # Create job
-    try:
-        r = requests.post(
-            f"{base}/search/jobs",
-            data={"search": f"search {query}", "output_mode": "json"},
-            auth=(user, pwd),
-            timeout=30,
-            verify=verify_tls,
-        )
-        r.raise_for_status()
-    except Exception as e:
-        print(f"[splunk] connect/create FAILED base={base} verify={verify_tls} user={user} err={e}")
-        return []
-    sid = (r.json() or {}).get("sid")
-    if not sid:
-        print(f"[splunk] no SID returned from {base}")
-        return []
+    """
+    Creates a search job and returns results (JSON list).
+    - Respects HTTP(S)_PROXY env vars.
+    - Tries multiple base paths automatically.
+    - Defensive logging to understand failures without crashing.
+    """
+    sess = requests.Session()
+    # Honor corporate proxy from env
+    p_http = os.getenv("HTTP_PROXY"); p_https = os.getenv("HTTPS_PROXY")
+    if p_http or p_https:
+        sess.proxies.update({"http": p_http, "https": p_https})
+        print(f"[splunk] using proxy http={p_http!s} https={p_https!s}")
 
-    # Poll until done
-    for _ in range(300):
+    for base in _splunk_bases(host):
         try:
-            j = requests.get(
-                f"{base}/search/jobs/{sid}",
-                params={"output_mode": "json"},
+            # CREATE JOB
+            print(f"[splunk] POST {base}/search/jobs")
+            r = sess.post(
+                f"{base}/search/jobs",
+                data={"search": f"search {query}", "output_mode": "json"},
                 auth=(user, pwd),
                 timeout=30,
                 verify=verify_tls,
             )
-            j.raise_for_status()
-            jj = j.json() or {}
-            entry = (jj.get("entry") or [{}])[0]
-            if entry.get("content", {}).get("isDone"):
-                break
-        except Exception as e:
-            print(f"[splunk] poll failed: {e}")
-            return []
-        time.sleep(1)
+            print(f"[splunk] create status={r.status_code} ct={r.headers.get('Content-Type')}")
+            if r.status_code != 200:
+                print(f"[splunk] create body(head): {r.text[:200]}")
+                continue
+            if not r.headers.get("Content-Type", "").lower().startswith("application/json"):
+                print("[splunk] create returned non-JSON (likely WAF); trying next base")
+                continue
+            data = r.json() or {}
+            sid = data.get("sid")
+            if not sid:
+                print("[splunk] no SID in JSON — trying next base")
+                continue
 
-    # Fetch results
-    try:
-        res = requests.get(
-            f"{base}/search/jobs/{sid}/results",
-            params={"output_mode": "json", "count": 50000},
-            auth=(user, pwd),
-            timeout=60,
-            verify=verify_tls,
-        )
-        res.raise_for_status()
-        jj = res.json() or {}
-        return jj.get("results", []) or []
-    except Exception as e:
-        print(f"[splunk] results fetch failed: {e}")
-        return []
+            # POLL UNTIL DONE
+            for _ in range(300):
+                j = sess.get(
+                    f"{base}/search/jobs/{sid}",
+                    params={"output_mode": "json"},
+                    auth=(user, pwd),
+                    timeout=30,
+                    verify=verify_tls,
+                )
+                if j.status_code != 200:
+                    print(f"[splunk] poll status={j.status_code} body(head): {j.text[:200]}")
+                    break
+                if not j.headers.get("Content-Type", "").lower().startswith("application/json"):
+                    print("[splunk] poll non-JSON — trying next base")
+                    break
+                jj = j.json() or {}
+                entry = (jj.get("entry") or [{}])[0]
+                if entry.get("content", {}).get("isDone"):
+                    break
+                time.sleep(1)
+
+            # FETCH RESULTS
+            res = sess.get(
+                f"{base}/search/jobs/{sid}/results",
+                params={"output_mode": "json", "count": 50000},
+                auth=(user, pwd),
+                timeout=60,
+                verify=verify_tls,
+            )
+            print(f"[splunk] results status={res.status_code} ct={res.headers.get('Content-Type')}")
+            if res.status_code != 200:
+                print(f"[splunk] results body(head): {res.text[:200]}")
+                continue
+            if not res.headers.get("Content-Type", "").lower().startswith("application/json"):
+                print("[splunk] results non-JSON — trying next base")
+                continue
+
+            return (res.json() or {}).get("results", []) or []
+
+        except Exception as e:
+            print(f"[splunk] base={base} error: {e} — trying alternate base...")
+            continue
+
+    print("[splunk] all bases failed — check VPN/proxy/host/creds")
+    return []
 
 def _spl_active_proxies_query(index: str) -> str:
     return f"""
@@ -142,6 +172,7 @@ def _spl_active_proxies_query(index: str) -> str:
     | fields apiproxy
     """
 
+# Metric SPL templates (index comes from .env so you can override easily)
 SPL_ONBOARDED_TMPL = """
 index={index} sourcetype=api_proxy earliest=-13mon
 | eval apiproxy=coalesce(apiproxy, apiProxy_proxyName)
@@ -183,7 +214,6 @@ def _latest_revision_from_sdk(apigee, proxy_name: str) -> Optional[str]:
     proxy_api = getattr(apigee, "proxy", None)
     if not proxy_api:
         return None
-    # common revision list methods
     for name in ("get_revisions", "list_revisions", "revisions"):
         if hasattr(proxy_api, name):
             try:
@@ -192,7 +222,6 @@ def _latest_revision_from_sdk(apigee, proxy_name: str) -> Optional[str]:
                     return str(sorted(map(int, map(str, revs)))[-1])
             except Exception:
                 pass
-    # sometimes SDKs expose a direct latest
     for name in ("get_latest_revision", "latest"):
         if hasattr(proxy_api, name):
             try:
@@ -202,7 +231,7 @@ def _latest_revision_from_sdk(apigee, proxy_name: str) -> Optional[str]:
                 pass
     return None
 
-# ----------------------- Catalog (config/metadata) -----------------------
+# ====================== Catalog (config/metadata) ======================
 
 def load_apigee_catalog(planet: str, org: str, env_key: str) -> List[Dict[str, Any]]:
     env_obj = ENV_OBJ_DICT.get(env_key)
@@ -216,10 +245,10 @@ def load_apigee_catalog(planet: str, org: str, env_key: str) -> List[Dict[str, A
         print(f"[catalog] Apigee init FAILED planet={planet} org={org} env={env_key} err={type(e).__name__}: {e}")
         return []
 
-    # Resolve Splunk base & creds via config
+    # Resolve Splunk host via mapping (or explicit SPLUNK_HOST in .env)
     from .config import load_settings
     s = load_settings()
-    splunk_host = _resolve_splunk_host(env_key, s.splunk_host)
+    splunk_host = _resolve_splunk_host_for_env(env_key, s.splunk_host)
 
     # choose discovery mode
     force_splunk = os.getenv("APIGEE_FORCE_SPLUNK_DISCOVERY", "").strip().lower() in ("1", "true", "t", "yes", "y")
@@ -271,7 +300,7 @@ def load_apigee_catalog(planet: str, org: str, env_key: str) -> List[Dict[str, A
         })
     return rows
 
-# ----------------------- Metrics (monthly aggregations) -----------------------
+# ====================== Metrics (monthly aggregations) ======================
 
 def _index_by_month(rows: List[Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     out: Dict[str, Dict[str, Any]] = {}

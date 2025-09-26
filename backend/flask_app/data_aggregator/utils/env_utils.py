@@ -1,6 +1,6 @@
 import os
 
-from flask_app.web.constants import LOCAL_ENV
+LOCAL_ENV = "e0"
 
 
 def get_my_env():

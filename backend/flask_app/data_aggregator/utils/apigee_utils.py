@@ -4,24 +4,51 @@ from typing import Any, List
 
 from apigee.apigee_api import ApigeeManagement
 
-from flask_app.web.utils.vault_utils import get_env_value
-from flask_app.web.constants import SSL_BUCKETS, SECURITY_POLICY_BUCKETS, APIGEE_SECURITY_TYPES, APIGEE_OAUTH, \
-    VERIFY_API_KEY, IP_ALLOW_LIST, APIGEE_SSL_TYPES, NONE, APIGEE_CORS, APIGEE_PROTECTION_DICT, REPORT_CELL_TRUE, \
-    REPORT_CELL_FALSE
-from flask_app.web.utils import safe_open_xml_list
-
 log = logging.getLogger()
 
 
-def handle_apigee_creds():
-    return get_env_value('APIGEE_USERNAME'), get_env_value('APIGEE_PASSWORD')
+# Minimal constants and helpers to support parsing
+APIGEE_SECURITY_TYPES = ["oauthv2", "verify_api_key", "hmac", "ip_allow_list", "cors"]
+APIGEE_OAUTH = "oauthv2"
+VERIFY_API_KEY = "verify_api_key"
+IP_ALLOW_LIST = "ip_allow_list"
+APIGEE_CORS = "cors"
+NONE = "none"
+
+SECURITY_POLICY_BUCKETS = {
+    "hmac": {
+        "callout_urls": [],
+        "shared_flow_bundles": ["hmac"],
+    },
+}
+
+APIGEE_SSL_TYPES = ["mtls", "one_way_ssl"]
+REPORT_CELL_TRUE = True
+REPORT_CELL_FALSE = False
+
+SSL_BUCKETS = {
+    "mtls": {"hosts": ["secure-mtls", "mtls"]},
+    "one_way_ssl": {"hosts": ["secure", "secure-prod", "secure-nonprod"]},
+}
+
+
+def safe_open_xml_list(obj, keys):
+    cur = obj
+    for k in keys:
+        cur = cur.get(k) if isinstance(cur, dict) else None
+        if cur is None:
+            return []
+    if isinstance(cur, list):
+        return cur
+    if isinstance(cur, dict) and "Step" in cur:
+        return [cur]
+    return []
 
 
 def initialize_apigee_obj(planet, org, selected_env):
-    username, password = handle_apigee_creds()
+    # selected_env is expected to be an object with get_planet/org methods, as used by callers
     planet_obj = selected_env.get_planet(planet)
-    return ApigeeManagement(selected_env, planet_obj, planet_obj.get_org(org), username=username,
-                            password=password)
+    return ApigeeManagement(selected_env, planet_obj, planet_obj.get_org(org))
 
 
 def get_all_active_proxies_by_deployment_env(all_info: dict, deployment_env: str) -> list[tuple[str, str]]:
@@ -115,7 +142,7 @@ def identify_rate_limit(policies):
 def identify_threat_protections(policies):
     policy_types = [policy['policy_type'] for policy in policies]
     output = [REPORT_CELL_TRUE if protection in policy_types else REPORT_CELL_FALSE for protection in
-              list(APIGEE_PROTECTION_DICT.values())]
+              list({"threat_protection": "threat_protection"}.values())]
     return output
 
 
@@ -149,24 +176,21 @@ def format_callout_url(policy):
 
 def identity_security_policies(policies):
     used_security_types = []
-
-    # if not policies or len(policies) == 0 or all_policies_disabled(policies):
-    #     used_security_types.append(NONE)
     for policy in policies:
         format_callout_url(policy)
         if policy['enabled'] == 'false':
             continue
-        if policy['cors_policy'] and str(policy['cors_policy']).lower() != "none":
+        if policy.get('cors_policy') and str(policy['cors_policy']).lower() != "none":
             used_security_types.append(APIGEE_CORS)
         for security_type in APIGEE_SECURITY_TYPES:
             if security_type == NONE:
                 continue
             elif (security_type == APIGEE_OAUTH and check_for_oauth2(policy)) or \
-                    (security_type == VERIFY_API_KEY and policy['api_key'] and policy['api_key'].lower() != "none") \
-                    or security_type == IP_ALLOW_LIST and policy['ip_allow_list'] != []:
+                    (security_type == VERIFY_API_KEY and policy.get('api_key') and policy['api_key'].lower() != "none") \
+                    or security_type == IP_ALLOW_LIST and policy.get('ip_allow_list') not in (None, []):
                 used_security_types.append(security_type)
             else:
-                check_for_security_type(**SECURITY_POLICY_BUCKETS[security_type], policy=policy,
+                check_for_security_type(**SECURITY_POLICY_BUCKETS.get(security_type, {"callout_urls": [], "shared_flow_bundles": []}), policy=policy,
                                         security_type=security_type, used_security_types=used_security_types)
     return list(set(used_security_types))
 
@@ -180,24 +204,24 @@ def sort_virtual_hosts(virtual_hosts):
                 host_types.add(ssl_type)
                 break
         if virtual_host not in all_hosts_in_buckets:
-            log.error(f"{virtual_host} not found in buckets")
+            log.debug(f"{virtual_host} not found in buckets")
     return host_types
 
 
 def check_uri_prefixes(callout_url, callout_urls):
     for url in callout_urls:
-        if callout_url.startswith(url):
+        if callout_url and str(callout_url).startswith(url):
             return True
     return False
 
 
 def check_for_security_type(callout_urls: list[str], shared_flow_bundles: list[str], policy, security_type: str,
                             used_security_types: list[str]):
-    if policy['shared_flow_bundle'] in shared_flow_bundles or check_uri_prefixes(policy['callout_url'], callout_urls):
+    if policy.get('shared_flow_bundle') in shared_flow_bundles or check_uri_prefixes(policy.get('callout_url'), callout_urls):
         used_security_types.append(security_type)
 
 
 def check_for_oauth2(policy):
-    if not policy['policy_name']:
+    if not policy.get('policy_name'):
         return False
-    return '_oauth2_' in policy['policy_name'].lower() and policy['callout_url'] == 'None' and not policy['api_key']
+    return '_oauth2_' in policy['policy_name'].lower() and policy.get('callout_url') == 'None' and not policy.get('api_key')

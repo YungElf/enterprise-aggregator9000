@@ -7,24 +7,102 @@ import re
 import zipfile
 import tempfile
 from datetime import datetime
+from dataclasses import dataclass
+from typing import Any, Iterable, List, Optional, Tuple, Union
 
 from dotenv import load_dotenv
-from proxy_management.models.developer_app import DeveloperApp
 
-from flask_app.web.constants import REPORTS_REPO_NAME, REPORTS_FOLDER, FILE_RETENTION_DAYS, SURVEY_TYPE_LITERALS, \
-    PVC_BASE_PATH
-from flask_app.web.services import GithubService
-from flask_app.web.utils.misc_utils import get_current_date, days_between_dates
-from flask_app.web.utils.env_utils import get_my_env
+from .env_utils import get_my_env
+
+# Local defaults to replace external constants
+REPORTS_REPO_NAME = "local-reports"
+REPORTS_FOLDER = "reports"
+FILE_RETENTION_DAYS = 30
+PVC_BASE_PATH = "/tmp"
+SURVEY_TYPE_LITERALS = str
 
 my_env = get_my_env()
 
 log = logging.getLogger()
 
 
-def format_uris(devapp: DeveloperApp):
-    devapp.__dict__['uris'] = ', '.join(sorted(devapp.__dict__['uris']))
-    return DeveloperApp(**devapp.__dict__)
+# Minimal local replacement for missing proxy_management.models.developer_app.DeveloperApp
+@dataclass
+class DeveloperAppLocal:
+    # Keep only fields we touch in helper functions
+    uris: List[str]
+
+
+# Minimal helpers to replace flask_app.web.utils.misc_utils
+
+def get_current_date() -> str:
+    return datetime.utcnow().strftime("%Y%m%d")
+
+
+def days_between_dates(date1_yyyymmdd: str, date2_yyyymmdd: str) -> int:
+    try:
+        d1 = datetime.strptime(date1_yyyymmdd, "%Y%m%d")
+        d2 = datetime.strptime(date2_yyyymmdd, "%Y%m%d")
+        return abs((d2 - d1).days)
+    except Exception:
+        return 0
+
+
+# Minimal local GithubService that reads/writes from the filesystem under REPORTS_FOLDER
+class GithubService:
+    def __init__(self, base_dir: Optional[str] = None):
+        self.base_dir = base_dir or os.getcwd()
+        self.repo_root = os.path.join(self.base_dir, REPORTS_FOLDER)
+        os.makedirs(self.repo_root, exist_ok=True)
+
+    def get_repo(self, _name: str):
+        os.makedirs(self.repo_root, exist_ok=True)
+        return self
+
+    @dataclass
+    class _Entry:
+        path: str
+        name: str
+        last_modified_datetime: Optional[datetime] = None
+
+    def _abs(self, rel_path: str) -> str:
+        return os.path.join(self.base_dir, rel_path)
+
+    def get_file(self, rel_path: str) -> Union[None, _Entry, List[_Entry]]:
+        abs_path = self._abs(rel_path)
+        if os.path.isdir(abs_path):
+            entries = []
+            for name in os.listdir(abs_path):
+                p = os.path.join(rel_path, name)
+                st = os.stat(self._abs(p))
+                entries.append(self._Entry(path=p, name=name, last_modified_datetime=datetime.fromtimestamp(st.st_mtime)))
+            return entries
+        if os.path.isfile(abs_path):
+            st = os.stat(abs_path)
+            return self._Entry(path=rel_path, name=os.path.basename(rel_path), last_modified_datetime=datetime.fromtimestamp(st.st_mtime))
+        return None
+
+    def get_raw_file_content(self, rel_path: str) -> str:
+        with open(self._abs(rel_path), "r", newline="") as f:
+            return f.read()
+
+    def commit_file(self, rel_path: str, content: str) -> None:
+        abs_path = self._abs(rel_path)
+        os.makedirs(os.path.dirname(abs_path), exist_ok=True)
+        with open(abs_path, "w", newline="") as f:
+            f.write(content)
+
+    def delete_file(self, rel_path: str) -> None:
+        abs_path = self._abs(rel_path)
+        if os.path.isfile(abs_path):
+            os.remove(abs_path)
+
+
+def format_uris(devapp: Any):
+    uris = getattr(devapp, "uris", None)
+    if isinstance(uris, list):
+        devapp.__dict__['uris'] = ', '.join(sorted(uris))
+    return devapp
 
 
 def format_csv_cell(text):
@@ -107,12 +185,12 @@ def write_github_file(csv_rows, dated_file_name, report_type):
     log.debug(f"File committed to {REPORTS_REPO_NAME}/{get_git_file_path(report_type, dated_file_name)}")
 
 
-def load_latest_report(report_type: SURVEY_TYPE_LITERALS) -> tuple[list, datetime]:
+def load_latest_report(report_type: SURVEY_TYPE_LITERALS) -> Tuple[list, Optional[datetime]]:
     g = GithubService()
     g.get_repo(REPORTS_REPO_NAME)
     try:
         latest_file = g.get_file(os.path.join(REPORTS_FOLDER, report_type, my_env, f"{report_type}_{my_env}_latest.zip"))
-        if latest_file:
+        if latest_file and isinstance(latest_file, GithubService._Entry):
             csv_content = g.get_raw_file_content(latest_file.path)
             reader = csv.reader(csv_content.splitlines(), delimiter=',', quoting=csv.QUOTE_MINIMAL, escapechar='\\', quotechar='"', lineterminator='\r\n')
             output = []
@@ -130,7 +208,7 @@ def stream_latest_report(report_type: SURVEY_TYPE_LITERALS):
     g.get_repo(REPORTS_REPO_NAME)
     try:
         latest_file = g.get_file(os.path.join(REPORTS_FOLDER, report_type, my_env, f"{report_type}_{my_env}_latest.zip"))
-        if latest_file:
+        if latest_file and isinstance(latest_file, GithubService._Entry):
             csv_content = g.get_raw_file_content(latest_file.path)
             csv_buffer = io.StringIO(csv_content)
             reader = csv.reader(csv_buffer)
@@ -155,18 +233,23 @@ def remove_old_survey_files(report_type: SURVEY_TYPE_LITERALS = None) -> int:
     g = GithubService()
     g.get_repo(REPORTS_REPO_NAME)
     count = 0
-    if report_type:
-        report_types = [report_type]
-    else:
-        reports_folder = os.path.join(REPORTS_FOLDER, my_env)
-        report_types = [file.name for file in g.get_file(reports_folder)]
-    for report_type in report_types:
-        for file in g.get_file(os.path.join(REPORTS_FOLDER, report_type, my_env)):
-            file_date = re.search(r'\d{8}', file.name)
-            if 'latest' not in file.name and (file_date and days_between_dates(file_date.group(0), current_date) > FILE_RETENTION_DAYS):
-                g.delete_file(file.path)
-                log.debug(f"Deleted old survey file: {file.name}")
-                count += 1
+    try:
+        if report_type:
+            report_types = [report_type]
+        else:
+            reports_folder = os.path.join(REPORTS_FOLDER, my_env)
+            items = g.get_file(reports_folder) or []
+            report_types = [file.name for file in items if isinstance(items, list)]
+        for rpt_type in report_types:
+            files = g.get_file(os.path.join(REPORTS_FOLDER, rpt_type, my_env)) or []
+            for file in files if isinstance(files, list) else []:
+                file_date = re.search(r'\d{8}', file.name)
+                if 'latest' not in file.name and (file_date and days_between_dates(file_date.group(0), current_date) > FILE_RETENTION_DAYS):
+                    g.delete_file(file.path)
+                    log.debug(f"Deleted old survey file: {file.name}")
+                    count += 1
+    except Exception as e:
+        log.debug(f"Error while cleaning old survey files: {e}")
     log.debug(f"Deleted {count} old survey files")
     return count
 

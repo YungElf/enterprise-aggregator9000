@@ -1,5 +1,4 @@
-dotenv==0.9.9
-psycopg2==2.9.10
+pg8000
 python-dotenv==1.1.1
-sqlalchemy>=2.0
 requests
+tzdata

@@ -4,8 +4,10 @@ from contextlib import contextmanager
 from urllib.parse import urlparse, unquote
 from pg8000 import dbapi as pg
 
-def _conn_params():
-    url = os.getenv("AGG_PG_URL")
+
+def _conn_params(url: str = None):
+    if url is None:
+        url = os.getenv("AGG_PG_URL")
     if url:
         url = re.sub(r"^\s*postgresql\+[^:]+://", "postgresql://", url)
         u = urlparse(url)
@@ -27,9 +29,11 @@ def _conn_params():
     host = re.sub(r"^\w+://", "", host)
     return dict(user=user, password=pwd, host=host, port=port, database=name)
 
+
 @contextmanager
-def get_conn():
-    params = _conn_params()
+
+def get_conn(pg_url: str = None):
+    params = _conn_params(pg_url)
     conn = pg.connect(**params)
     try:
         yield conn
@@ -39,6 +43,7 @@ def get_conn():
         raise
     finally:
         conn.close()
+
 
 def upsert_apigee_config_data(conn, rows: list[dict]):
     cur = conn.cursor()
@@ -80,6 +85,7 @@ def upsert_apigee_config_data(conn, rows: list[dict]):
       updated_at=excluded.updated_at
     """, data)
     cur.close()
+
 
 def upsert_apigee_metrics(conn, rows: list[dict]):
     cur = conn.cursor()

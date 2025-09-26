@@ -7,8 +7,7 @@ import requests
 # Map "e1/e2/e3" -> env objects (E1_ENV/E2_ENV/E3_ENV)
 from .utils.apigee_constants import ENV_OBJ_DICT
 
-# Import Apigee helpers (from your utils). If SDK is missing, you can move these
-# inside the function and guard with try/except to skip catalog gracefully.
+# Apigee helpers from your utils (SDK-dependent)
 from .utils.apigee_utils import (
     initialize_apigee_obj,
     get_all_active_proxies_by_deployment_env,
@@ -16,6 +15,8 @@ from .utils.apigee_utils import (
     get_policy_analysis_dict,
     get_virtual_host_analysis_dict,
 )
+
+# ----------------------- small helpers -----------------------
 
 def _security_mechanism(policy_summary: dict, ssl_flags: dict) -> str:
     if policy_summary.get("oauthv2"): return "oauth2"
@@ -38,11 +39,103 @@ def _first_target_host(targets):
 
 def _phoenix_month(val: str) -> str:
     try:
-        dt = datetime.strptime(val, "%Y-%m-%d")
+        from datetime import datetime as _dt
+        dt = _dt.strptime(val, "%Y-%m-%d")
     except Exception:
-        dt = datetime.fromtimestamp(float(val), tz=timezone.utc)
+        from datetime import datetime as _dt
+        dt = _dt.fromtimestamp(float(val), tz=timezone.utc)
     phx = dt.astimezone(ZoneInfo("America/Phoenix"))
     return f"{phx.year:04d}-{phx.month:02d}-01"
+
+# ----------------------- resilient discovery -----------------------
+
+def _maybe_get_all_info(apigee):
+    """
+    Try common SDK layouts to fetch 'all_info' (environments + proxies + revisions).
+    """
+    candidates = (
+        "mgmt", "management", "admin", "org", "mgmt_api", ""  # "" means try apigee itself
+    )
+    for attr in candidates:
+        obj = getattr(apigee, attr, None) if attr else apigee
+        if obj and hasattr(obj, "get_all_info"):
+            try:
+                return obj.get_all_info()
+            except Exception:
+                pass
+    return None
+
+def _safe_active_pairs(apigee, env_key: str):
+    """
+    Return [(proxy, revision), ...] deployed in env_key.
+    1) Prefer your utility that parses 'all_info' if we can get it from the SDK.
+    2) Else, probe the proxy API to synthesize the list.
+    """
+    # 1) Try the fast path if SDK exposes get_all_info()
+    all_info = _maybe_get_all_info(apigee)
+    if all_info:
+        try:
+            return get_all_active_proxies_by_deployment_env(all_info, env_key)
+        except Exception:
+            pass
+
+    # 2) Probe the proxy API with several common method names
+    pairs = []
+    proxy_api = getattr(apigee, "proxy", None)
+    if not proxy_api:
+        return pairs  # give up; caller will handle empty list
+
+    # list proxies
+    proxies = None
+    for name in ("list_proxies", "get_proxies", "list"):
+        if hasattr(proxy_api, name):
+            try:
+                proxies = getattr(proxy_api, name)()
+                break
+            except Exception:
+                pass
+    if not proxies:
+        return pairs
+
+    # for each proxy, try to find deployed revisions in this env
+    for p in proxies:
+        revs = None
+        for name in ("get_revisions", "list_revisions", "revisions"):
+            if hasattr(proxy_api, name):
+                try:
+                    revs = getattr(proxy_api, name)(p)
+                    break
+                except Exception:
+                    pass
+        if not revs:
+            continue
+
+        for r in revs:
+            # check deployment state for this env
+            deployed = False
+            # common shapes we try:
+            candidates = [
+                ("get_proxy_deployments", (p, r)),
+                ("get_deployments", (p,)),  # may return per-env structure
+                ("is_deployed", (p, r, env_key)),
+            ]
+            for meth, args in candidates:
+                if hasattr(proxy_api, meth):
+                    try:
+                        resp = getattr(proxy_api, meth)(*args)
+                        # heuristics: if it's a bool from is_deployed
+                        if isinstance(resp, bool):
+                            deployed = resp
+                        else:
+                            # look for env_key in the response
+                            s = str(resp).lower()
+                            deployed = env_key.lower() in s and ("deploy" in s or "state" in s or "revision" in s)
+                        break
+                    except Exception:
+                        pass
+            if deployed:
+                pairs.append((p, str(r)))
+    return pairs
 
 # ----------------------- CATALOG (Apigee Mgmt API) -----------------------
 
@@ -52,17 +145,21 @@ def load_apigee_catalog(planet: str, org: str, env_key: str) -> list[dict]:
     org:    org name valid for that env
     env_key: 'e1' | 'e2' | 'e3' (looked up in ENV_OBJ_DICT)
     """
-    env_obj = ENV_OBJ_DICT.get(env_key)  # critical: get the actual env object
+    env_obj = ENV_OBJ_DICT.get(env_key)
     if env_obj is None:
         raise ValueError(f"[catalog] Unknown APIGEE_ENV '{env_key}'. Available: {list(ENV_OBJ_DICT.keys())}")
 
     apigee = initialize_apigee_obj(planet, org, env_obj)
 
-    all_info = apigee.mgmt.get_all_info()
-    pairs = get_all_active_proxies_by_deployment_env(all_info, env_key)  # [(proxy, revision), ...]
+    # ← this used to be: apigee.mgmt.get_all_info() ...
+    pairs = _safe_active_pairs(apigee, env_key)
+    if not pairs:
+        print(f"[catalog] No active proxies found for env '{env_key}'.")
+        return []
+
     rows = []
     for proxy, rev in pairs:
-        parsed = fetch_apigee_xml_data(apigee, proxy, rev)
+        parsed, _xml = fetch_apigee_xml_data(apigee, proxy, rev)
         pol = get_policy_analysis_dict(parsed["policies"])
         ssl = get_virtual_host_analysis_dict(parsed["virtual_hosts"])
         rows.append({
@@ -114,7 +211,6 @@ index=2000004162_api_e3_idx1 sourcetype=api_proxy earliest=-13mon
 
 def _run_splunk(host, user, pwd, query: str, verify_tls: bool = True):
     base = f"{host}/services"
-    # create job
     r = requests.post(
         f"{base}/search/jobs",
         data={"search": f"search {query}", "output_mode": "json"},
@@ -125,7 +221,6 @@ def _run_splunk(host, user, pwd, query: str, verify_tls: bool = True):
     r.raise_for_status()
     sid = r.json()["sid"]
 
-    # wait
     for _ in range(300):
         j = requests.get(
             f"{base}/search/jobs/{sid}",
@@ -139,7 +234,6 @@ def _run_splunk(host, user, pwd, query: str, verify_tls: bool = True):
             break
         time.sleep(1)
 
-    # results
     res = requests.get(
         f"{base}/search/jobs/{sid}/results",
         params={"output_mode": "json", "count": 50000},
@@ -163,8 +257,8 @@ def fetch_apigee_monthlies(splunk_host, splunk_user, splunk_password, verify_tls
     tps       = _index_by_month(_run_splunk(splunk_host, splunk_user, splunk_password, SPL_TPS,       verify_tls))
     cons      = _index_by_month(_run_splunk(splunk_host, splunk_user, splunk_password, SPL_CONSUMERS, verify_tls))
     traffic   = _index_by_month(_run_splunk(splunk_host, splunk_user, splunk_password, SPL_TRAFFIC,   verify_tls))
-
     months = sorted(set(onboarded) | set(tps) | set(cons) | set(traffic))
+
     out = []
     for m in months:
         row = {"month": m}

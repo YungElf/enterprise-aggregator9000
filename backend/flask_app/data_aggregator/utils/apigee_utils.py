@@ -69,9 +69,11 @@ def initialize_apigee_obj(planet, org, selected_env):
     # Build kwargs based on ApigeeManagement __init__ signature
     try:
         sig = inspect.signature(ApigeeManagement.__init__)
-        param_names = {p for p in sig.parameters.keys() if p != "self"}
-    except Exception:
-        param_names = set()
+        param_names = [p for p in sig.parameters.keys() if p != "self"]
+        print(f"[apigee] ApigeeManagement.__init__ params: {param_names}")
+    except Exception as e:
+        param_names = []
+        print(f"[apigee] Could not introspect ApigeeManagement: {e}")
 
     value_by_key = {
         "environment": selected_env,
@@ -88,7 +90,8 @@ def initialize_apigee_obj(planet, org, selected_env):
         "pwd": password,
         "token": os.getenv("APIGEE_TOKEN"),
     }
-    kwargs = {k: v for k, v in value_by_key.items() if k in param_names and v is not None}
+    kwargs = {k: v for k, v in value_by_key.items() if k in set(param_names) and v is not None}
+    print(f"[apigee] attempting kwargs init with keys={sorted(kwargs.keys())} (env={selected_env}, planet={planet}, org={org})")
 
     # Try kwargs-only init first to avoid wrong positional arity
     try:
@@ -96,10 +99,11 @@ def initialize_apigee_obj(planet, org, selected_env):
             client = ApigeeManagement(**kwargs)
         else:
             client = ApigeeManagement()
-        log.debug(f"ApigeeManagement initialized with kwargs: {sorted(kwargs.keys())}")
+        print("[apigee] kwargs init succeeded")
         return client
     except Exception as e:
         last_exc = e
+        print(f"[apigee] kwargs init failed: {type(e).__name__}: {e}")
 
     # Then try common positional permutations (with optional auth kwargs)
     auth_kwargs = {}
@@ -109,21 +113,23 @@ def initialize_apigee_obj(planet, org, selected_env):
         auth_kwargs["password"] = password
 
     attempts = (
-        lambda: ApigeeManagement(selected_env, planet, org, **auth_kwargs),
-        lambda: ApigeeManagement(planet, org, selected_env, **auth_kwargs),
-        lambda: ApigeeManagement(selected_env, org, **auth_kwargs),
-        lambda: ApigeeManagement(org, selected_env, **auth_kwargs),
-        lambda: ApigeeManagement(org, **auth_kwargs),
-        lambda: ApigeeManagement(**auth_kwargs),
-        lambda: ApigeeManagement(),
+        ("(env, planet, org)", lambda: ApigeeManagement(selected_env, planet, org, **auth_kwargs)),
+        ("(planet, org, env)", lambda: ApigeeManagement(planet, org, selected_env, **auth_kwargs)),
+        ("(env, org)", lambda: ApigeeManagement(selected_env, org, **auth_kwargs)),
+        ("(org, env)", lambda: ApigeeManagement(org, selected_env, **auth_kwargs)),
+        ("(org)", lambda: ApigeeManagement(org, **auth_kwargs)),
+        ("(**auth)", lambda: ApigeeManagement(**auth_kwargs)),
+        ("()", lambda: ApigeeManagement()),
     )
-    for ctor in attempts:
+    for label, ctor in attempts:
         try:
+            print(f"[apigee] attempting positional init {label}")
             client = ctor()
-            log.debug("ApigeeManagement initialized via positional attempt")
+            print(f"[apigee] positional init succeeded via {label}")
             return client
         except Exception as e:
             last_exc = e
+            print(f"[apigee] positional init {label} failed: {type(e).__name__}: {e}")
             continue
 
     raise RuntimeError(f"Unable to initialize ApigeeManagement; last error: {last_exc}")

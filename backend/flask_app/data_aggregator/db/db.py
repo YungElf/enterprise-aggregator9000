@@ -45,6 +45,8 @@ def get_conn(pg_url: str = None):
         conn.close()
 
 
+# ================== Legacy tables (kept for compatibility) ==================
+
 def upsert_apigee_config_data(conn, rows: list[dict]):
     cur = conn.cursor()
     cur.execute("""
@@ -129,5 +131,140 @@ def upsert_apigee_metrics(conn, rows: list[dict]):
       requests=excluded.requests,
       bytes_in=excluded.bytes_in,
       bytes_out=excluded.bytes_out
+    """, data)
+    cur.close()
+
+
+# ================== New enterprise tables ==================
+
+def upsert_enterprise_api_apigee_metadata(conn, rows: list[dict]):
+    cur = conn.cursor()
+    cur.execute("""
+    create table if not exists enterprise_api_apigee_metadata(
+      id bigserial primary key,
+      org_name text not null,
+      env_name text not null,
+      central_id text,
+      proxy_name text not null,
+      proxy_base_path text,
+      proxy_resource_path text,
+      security_mechanism text,
+      backend_target_path text,
+      rate_limit text,
+      io_timeout int,
+      connect_timeout int,
+      developer_name text,
+      developer_app_name text,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      unique (org_name, env_name, proxy_name)
+    )""")
+    if not rows:
+        cur.close(); return
+    data = []
+    for r in rows:
+        data.append((
+            r.get("org_name"),
+            r.get("env_name"),
+            r.get("central_id"),
+            r.get("proxy_name"),
+            r.get("proxy_base_path"),
+            r.get("proxy_resource_path"),
+            r.get("security_mechanism"),
+            r.get("backend_target_path"),
+            r.get("rate_limit"),
+            r.get("io_timeout"),
+            r.get("connect_timeout"),
+            r.get("developer_name"),
+            r.get("developer_app_name"),
+        ))
+    cur.executemany("""
+    insert into enterprise_api_apigee_metadata (
+      org_name, env_name, central_id, proxy_name, proxy_base_path, proxy_resource_path,
+      security_mechanism, backend_target_path, rate_limit, io_timeout, connect_timeout,
+      developer_name, developer_app_name
+    ) values (
+      %s,%s,%s,%s,%s,%s,
+      %s,%s,%s,%s,%s,
+      %s,%s
+    ) on conflict (org_name, env_name, proxy_name) do update set
+      central_id=excluded.central_id,
+      proxy_base_path=excluded.proxy_base_path,
+      proxy_resource_path=excluded.proxy_resource_path,
+      security_mechanism=excluded.security_mechanism,
+      backend_target_path=excluded.backend_target_path,
+      rate_limit=excluded.rate_limit,
+      io_timeout=excluded.io_timeout,
+      connect_timeout=excluded.connect_timeout,
+      developer_name=excluded.developer_name,
+      developer_app_name=excluded.developer_app_name,
+      updated_at=now()
+    """, data)
+    cur.close()
+
+
+def upsert_enterprise_api_volume_metrics(conn, rows: list[dict]):
+    cur = conn.cursor()
+    cur.execute("""
+    create table if not exists enterprise_api_volume_metrics(
+      id bigserial primary key,
+      gateway_name text not null,
+      proxy_name text,
+      central_id text,
+      proxy_uri text,
+      start_date date not null,
+      end_date date not null,
+      volume bigint,
+      success_200_count bigint,
+      failure_401_count bigint,
+      failure_400_count bigint,
+      failure_500_count bigint,
+      failure_503_count bigint,
+      failure_504_count bigint,
+      failure_429_count bigint,
+      created_at timestamptz not null default now(),
+      updated_at timestamptz not null default now(),
+      unique (gateway_name, proxy_name, central_id, start_date, end_date)
+    )""")
+    if not rows:
+        cur.close(); return
+    data = []
+    for r in rows:
+        data.append((
+            r.get("gateway_name"),
+            r.get("proxy_name"),
+            r.get("central_id"),
+            r.get("proxy_uri"),
+            r.get("start_date"),
+            r.get("end_date"),
+            r.get("volume"),
+            r.get("success_200_count"),
+            r.get("failure_401_count"),
+            r.get("failure_400_count"),
+            r.get("failure_500_count"),
+            r.get("failure_503_count"),
+            r.get("failure_504_count"),
+            r.get("failure_429_count"),
+        ))
+    cur.executemany("""
+    insert into enterprise_api_volume_metrics (
+      gateway_name, proxy_name, central_id, proxy_uri, start_date, end_date,
+      volume, success_200_count, failure_401_count, failure_400_count, failure_500_count,
+      failure_503_count, failure_504_count, failure_429_count
+    ) values (
+      %s,%s,%s,%s,%s,%s,
+      %s,%s,%s,%s,%s,
+      %s,%s,%s
+    ) on conflict (gateway_name, proxy_name, central_id, start_date, end_date) do update set
+      proxy_uri=excluded.proxy_uri,
+      volume=excluded.volume,
+      success_200_count=excluded.success_200_count,
+      failure_401_count=excluded.failure_401_count,
+      failure_400_count=excluded.failure_400_count,
+      failure_500_count=excluded.failure_500_count,
+      failure_503_count=excluded.failure_503_count,
+      failure_504_count=excluded.failure_504_count,
+      failure_429_count=excluded.failure_429_count,
+      updated_at=now()
     """, data)
     cur.close()

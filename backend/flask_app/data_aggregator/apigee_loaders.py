@@ -15,6 +15,12 @@ from .utils.apigee_utils import (
     get_policy_analysis_dict,
     get_virtual_host_analysis_dict,
 )
+from .utils.network_utils import get_amex_proxies_verified
+
+try:
+    from amexcerts import certificate_path as _amex_cert_path
+except Exception:
+    _amex_cert_path = None
 
 # ====================== Small helpers ======================
 
@@ -82,16 +88,23 @@ def _splunk_bases(host: str) -> List[str]:
 def _run_splunk(host: str, user: str, pwd: str, query: str, verify_tls: bool = True) -> List[Dict[str, Any]]:
     """
     Creates a search job and returns results (JSON list).
-    - Respects HTTP(S)_PROXY env vars.
+    - Respects HTTP(S)_PROXY env vars or Amex helper if provided.
     - Tries multiple base paths automatically.
     - Defensive logging to understand failures without crashing.
     """
     sess = requests.Session()
-    # Honor corporate proxy from env
-    p_http = os.getenv("HTTP_PROXY"); p_https = os.getenv("HTTPS_PROXY")
-    if p_http or p_https:
-        sess.proxies.update({"http": p_http, "https": p_https})
-        print(f"[splunk] using proxy http={p_http!s} https={p_https!s}")
+    # Prefer explicit Amex helper if creds are set; else honor generic env proxies
+    amex = get_amex_proxies_verified()
+    if amex:
+        sess.proxies.update(amex)
+        print("[splunk] using Amex corporate proxy")
+    else:
+        p_http = os.getenv("HTTP_PROXY"); p_https = os.getenv("HTTPS_PROXY")
+        if p_http or p_https:
+            sess.proxies.update({"http": p_http, "https": p_https})
+            print(f"[splunk] using proxy http={p_http!s} https={p_https!s}")
+
+    verify_param = _amex_cert_path() if (_amex_cert_path and verify_tls) else verify_tls
 
     for base in _splunk_bases(host):
         try:
@@ -102,7 +115,7 @@ def _run_splunk(host: str, user: str, pwd: str, query: str, verify_tls: bool = T
                 data={"search": f"search {query}", "output_mode": "json"},
                 auth=(user, pwd),
                 timeout=30,
-                verify=verify_tls,
+                verify=verify_param,
             )
             print(f"[splunk] create status={r.status_code} ct={r.headers.get('Content-Type')}")
             if r.status_code != 200:
@@ -124,7 +137,7 @@ def _run_splunk(host: str, user: str, pwd: str, query: str, verify_tls: bool = T
                     params={"output_mode": "json"},
                     auth=(user, pwd),
                     timeout=30,
-                    verify=verify_tls,
+                    verify=verify_param,
                 )
                 if j.status_code != 200:
                     print(f"[splunk] poll status={j.status_code} body(head): {j.text[:200]}")
@@ -144,7 +157,7 @@ def _run_splunk(host: str, user: str, pwd: str, query: str, verify_tls: bool = T
                 params={"output_mode": "json", "count": 50000},
                 auth=(user, pwd),
                 timeout=60,
-                verify=verify_tls,
+                verify=verify_param,
             )
             print(f"[splunk] results status={res.status_code} ct={res.headers.get('Content-Type')}")
             if res.status_code != 200:

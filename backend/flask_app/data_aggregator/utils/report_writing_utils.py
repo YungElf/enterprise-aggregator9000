@@ -234,20 +234,20 @@ def remove_old_survey_files(report_type: SURVEY_TYPE_LITERALS = None) -> int:
     g.get_repo(REPORTS_REPO_NAME)
     count = 0
     try:
-        if report_type:
-            report_types = [report_type]
-        else:
-            reports_folder = os.path.join(REPORTS_FOLDER, my_env)
+    if report_type:
+        report_types = [report_type]
+    else:
+        reports_folder = os.path.join(REPORTS_FOLDER, my_env)
             items = g.get_file(reports_folder) or []
             report_types = [file.name for file in items if isinstance(items, list)]
         for rpt_type in report_types:
             files = g.get_file(os.path.join(REPORTS_FOLDER, rpt_type, my_env)) or []
             for file in files if isinstance(files, list) else []:
-                file_date = re.search(r'\d{8}', file.name)
-                if 'latest' not in file.name and (file_date and days_between_dates(file_date.group(0), current_date) > FILE_RETENTION_DAYS):
-                    g.delete_file(file.path)
-                    log.debug(f"Deleted old survey file: {file.name}")
-                    count += 1
+            file_date = re.search(r'\d{8}', file.name)
+            if 'latest' not in file.name and (file_date and days_between_dates(file_date.group(0), current_date) > FILE_RETENTION_DAYS):
+                g.delete_file(file.path)
+                log.debug(f"Deleted old survey file: {file.name}")
+                count += 1
     except Exception as e:
         log.debug(f"Error while cleaning old survey files: {e}")
     log.debug(f"Deleted {count} old survey files")

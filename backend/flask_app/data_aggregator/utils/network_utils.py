@@ -1,5 +1,6 @@
 import os
 from typing import Dict
+from urllib.parse import quote
 
 
 def get_amex_proxies_verified() -> Dict[str, str]:
@@ -20,6 +21,6 @@ def get_amex_proxies_verified() -> Dict[str, str]:
     secret = os.getenv("AMEX_PROXY_SECRET") or os.getenv("PROXY_SECRET") or os.getenv("HTTP_PROXY_PASS")
     if not (ads and secret):
         return {}
-    auth = f"{ads}:{secret}"
+    auth = f"{quote(ads, safe='')}:{quote(secret, safe='')}"
     proxy = f"http://{auth}@proxy.aexp.com:8080"
     return {"http": proxy, "https": proxy}

@@ -1,5 +1,6 @@
 import logging
 import re
+import os
 from typing import Any, List
 
 from apigee.apigee_api import ApigeeManagement
@@ -45,10 +46,51 @@ def safe_open_xml_list(obj, keys):
     return []
 
 
+def _normalize_planet(planet: str, selected_env) -> str:
+    p = (str(planet or "")).strip().upper()
+    if p in {"PROD", "PRODUCTION"}: return "R3"
+    if p in {"TEST", "NONPROD", "NP"}: return "R2"
+    if p in {"DEV"}: return "R1"
+    # If the env object exposes a name like E1/E2/E3 and planet is blank or generic
+    env_name = str(getattr(selected_env, "name", "")).strip().upper()
+    if p in {"", "DEFAULT"}:
+        if env_name.endswith("E3"): return "R3"
+        if env_name.endswith("E2"): return "R2"
+        if env_name.endswith("E1"): return "R1"
+    return planet
+
+
 def initialize_apigee_obj(planet, org, selected_env):
-    # selected_env is expected to be an object with get_planet/org methods, as used by callers
-    planet_obj = selected_env.get_planet(planet)
-    return ApigeeManagement(selected_env, planet_obj, planet_obj.get_org(org))
+    username = os.getenv("APIGEE_USERNAME")
+    password = os.getenv("APIGEE_PASSWORD")
+    creds = {"username": username, "password": password} if username and password else {}
+
+    planet = _normalize_planet(planet, selected_env)
+
+    attempts = []
+    # Object-style
+    attempts.append(("object:get_planet", lambda: ApigeeManagement(selected_env, selected_env.get_planet(planet), selected_env.get_planet(planet).get_org(org), **creds) if creds else ApigeeManagement(selected_env, selected_env.get_planet(planet), selected_env.get_planet(planet).get_org(org))))
+    # With planet
+    attempts.append(("(env, planet, org)", lambda: ApigeeManagement(selected_env, planet, org, **creds) if creds else ApigeeManagement(selected_env, planet, org)))
+    attempts.append(("(planet, org, env)", lambda: ApigeeManagement(planet, org, selected_env, **creds) if creds else ApigeeManagement(planet, org, selected_env)))
+    # Without planet
+    attempts.append(("(env, org)", lambda: ApigeeManagement(selected_env, org, **creds) if creds else ApigeeManagement(selected_env, org)))
+    attempts.append(("(org, env)", lambda: ApigeeManagement(org, selected_env, **creds) if creds else ApigeeManagement(org, selected_env)))
+    # Minimal
+    attempts.append(("(org)", lambda: ApigeeManagement(org, **creds) if creds else ApigeeManagement(org)))
+    attempts.append(("()", lambda: ApigeeManagement(**creds) if creds else ApigeeManagement()))
+
+    last_exc = None
+    for label, ctor in attempts:
+        try:
+            client = ctor()
+            log.debug(f"ApigeeManagement initialized via {label}")
+            return client
+        except Exception as e:
+            last_exc = e
+            continue
+
+    raise RuntimeError(f"Unable to initialize ApigeeManagement; last error: {last_exc}")
 
 
 def get_all_active_proxies_by_deployment_env(all_info: dict, deployment_env: str) -> list[tuple[str, str]]:

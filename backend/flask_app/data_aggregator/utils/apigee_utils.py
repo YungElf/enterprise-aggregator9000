@@ -52,7 +52,6 @@ def _normalize_planet(planet: str, selected_env) -> str:
     if p in {"PROD", "PRODUCTION"}: return "R3"
     if p in {"TEST", "NONPROD", "NP"}: return "R2"
     if p in {"DEV"}: return "R1"
-    # If the env object exposes a name like E1/E2/E3 and planet is blank or generic
     env_name = str(getattr(selected_env, "name", "")).strip().upper()
     if p in {"", "DEFAULT"}:
         if env_name.endswith("E3"): return "R3"
@@ -102,12 +101,30 @@ def initialize_apigee_obj(planet, org, selected_env):
     except Exception as e:
         last_exc = e
 
-    # Fallback attempts (kept minimal)
-    for attempt in (lambda: ApigeeManagement(),):
+    # Then try common positional permutations (with optional auth kwargs)
+    auth_kwargs = {}
+    if username is not None:
+        auth_kwargs["username"] = username
+    if password is not None:
+        auth_kwargs["password"] = password
+
+    attempts = (
+        lambda: ApigeeManagement(selected_env, planet, org, **auth_kwargs),
+        lambda: ApigeeManagement(planet, org, selected_env, **auth_kwargs),
+        lambda: ApigeeManagement(selected_env, org, **auth_kwargs),
+        lambda: ApigeeManagement(org, selected_env, **auth_kwargs),
+        lambda: ApigeeManagement(org, **auth_kwargs),
+        lambda: ApigeeManagement(**auth_kwargs),
+        lambda: ApigeeManagement(),
+    )
+    for ctor in attempts:
         try:
-            return attempt()
+            client = ctor()
+            log.debug("ApigeeManagement initialized via positional attempt")
+            return client
         except Exception as e:
             last_exc = e
+            continue
 
     raise RuntimeError(f"Unable to initialize ApigeeManagement; last error: {last_exc}")
 

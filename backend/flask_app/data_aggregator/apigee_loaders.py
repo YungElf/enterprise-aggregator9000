@@ -108,14 +108,42 @@ def _run_splunk(host: str, user: str, pwd: str, query: str, verify_tls: bool = T
 
     for base in _splunk_bases(host):
         try:
-            # CREATE JOB
+            # First, try export (oneshot) to avoid WAF redirects to HTML login pages
+            print(f"[splunk] EXPORT {base}/search/jobs/export")
+            exp = sess.post(
+                f"{base}/search/jobs/export",
+                data={"search": f"search {query}", "output_mode": "json"},
+                auth=(user, pwd),
+                timeout=60,
+                verify=verify_param,
+            )
+            ct = exp.headers.get("Content-Type", "")
+            print(f"[splunk] export status={exp.status_code} ct={ct}")
+            if exp.status_code == 200 and ct.lower().startswith("application/json"):
+                j = exp.json() or {}
+                # export returns streaming JSON; normalize to list if needed
+                results = j.get("results") if isinstance(j, dict) else None
+                if isinstance(results, list):
+                    return results
+                # Some Splunk setups return JSON per line; best-effort parse
+                try:
+                    lines = [line for line in exp.text.splitlines() if line.strip()]
+                    parsed = []
+                    for ln in lines:
+                        try:
+                            parsed.append(requests.utils.json.loads(ln))
+                        except Exception:
+                            pass
+                    if parsed:
+                        return parsed
+                except Exception:
+                    pass
+            # Fall back to create + poll pattern
             print(f"[splunk] POST {base}/search/jobs")
             r = sess.post(
                 f"{base}/search/jobs",
                 data={"search": f"search {query}", "output_mode": "json"},
-                auth=(user, pwd),
-                timeout=30,
-                verify=verify_param,
+                auth=(user, pwd), timeout=30, verify=verify_param,
             )
             print(f"[splunk] create status={r.status_code} ct={r.headers.get('Content-Type')}")
             if r.status_code != 200:
@@ -130,14 +158,11 @@ def _run_splunk(host: str, user: str, pwd: str, query: str, verify_tls: bool = T
                 print("[splunk] no SID in JSON — trying next base")
                 continue
 
-            # POLL UNTIL DONE
             for _ in range(300):
                 j = sess.get(
                     f"{base}/search/jobs/{sid}",
                     params={"output_mode": "json"},
-                    auth=(user, pwd),
-                    timeout=30,
-                    verify=verify_param,
+                    auth=(user, pwd), timeout=30, verify=verify_param,
                 )
                 if j.status_code != 200:
                     print(f"[splunk] poll status={j.status_code} body(head): {j.text[:200]}")
@@ -151,13 +176,10 @@ def _run_splunk(host: str, user: str, pwd: str, query: str, verify_tls: bool = T
                     break
                 time.sleep(1)
 
-            # FETCH RESULTS
             res = sess.get(
                 f"{base}/search/jobs/{sid}/results",
                 params={"output_mode": "json", "count": 50000},
-                auth=(user, pwd),
-                timeout=60,
-                verify=verify_param,
+                auth=(user, pwd), timeout=60, verify=verify_param,
             )
             print(f"[splunk] results status={res.status_code} ct={res.headers.get('Content-Type')}")
             if res.status_code != 200:

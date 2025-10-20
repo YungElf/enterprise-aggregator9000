@@ -112,7 +112,20 @@ def initialize_apigee_obj(planet, org, selected_env):
     if password is not None:
         auth_kwargs["password"] = password
 
+    # Object components if available
+    planet_obj = None
+    org_obj = None
+    try:
+        if hasattr(selected_env, "get_planet"):
+            planet_obj = selected_env.get_planet(planet)
+        if planet_obj and hasattr(planet_obj, "get_org"):
+            org_obj = planet_obj.get_org(org)
+        print(f"[apigee] env={getattr(selected_env,'name',selected_env)} planet_obj={planet_obj} org_obj={org_obj}")
+    except Exception as e:
+        print(f"[apigee] object component lookup failed: {e}")
+
     attempts = (
+        ("(envObj, planetObj, orgObj)", lambda: ApigeeManagement(selected_env, planet_obj, org_obj, **auth_kwargs) if (planet_obj and org_obj) else (_ for _ in ()).throw(TypeError("missing obj components"))),
         ("(env, planet, org)", lambda: ApigeeManagement(selected_env, planet, org, **auth_kwargs)),
         ("(planet, org, env)", lambda: ApigeeManagement(planet, org, selected_env, **auth_kwargs)),
         ("(env, org)", lambda: ApigeeManagement(selected_env, org, **auth_kwargs)),

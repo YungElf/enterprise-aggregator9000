@@ -90,7 +90,7 @@ def _run_splunk(host: str, user: str, pwd: str, query: str, verify_tls: bool = T
     Creates a search job and returns results (JSON list).
     - Respects HTTP(S)_PROXY env vars or Amex helper if provided.
     - Tries multiple base paths automatically.
-    - Defensive logging to understand failures without crashing.
+    - Supports token auth via SPLUNK_TOKEN (preferred on corp networks).
     """
     sess = requests.Session()
     # Prefer explicit Amex helper if creds are set; else honor generic env proxies
@@ -106,14 +106,21 @@ def _run_splunk(host: str, user: str, pwd: str, query: str, verify_tls: bool = T
 
     verify_param = _amex_cert_path() if (_amex_cert_path and verify_tls) else verify_tls
 
+    # Auth: prefer token header if provided
+    token = os.getenv("SPLUNK_TOKEN")
+    use_token = bool(token)
+    headers = {"Authorization": f"Splunk {token}", "Content-Type": "application/x-www-form-urlencoded"} if use_token else {}
+    auth = None if use_token else (user, pwd)
+
     for base in _splunk_bases(host):
         try:
             # First, try export (oneshot) to avoid WAF redirects to HTML login pages
-            print(f"[splunk] EXPORT {base}/search/jobs/export")
+            print(f"[splunk] EXPORT {base}/search/jobs/export (token={use_token})")
             exp = sess.post(
                 f"{base}/search/jobs/export",
                 data={"search": f"search {query}", "output_mode": "json"},
-                auth=(user, pwd),
+                headers=headers if use_token else None,
+                auth=auth,
                 timeout=60,
                 verify=verify_param,
             )
@@ -121,11 +128,9 @@ def _run_splunk(host: str, user: str, pwd: str, query: str, verify_tls: bool = T
             print(f"[splunk] export status={exp.status_code} ct={ct}")
             if exp.status_code == 200 and ct.lower().startswith("application/json"):
                 j = exp.json() or {}
-                # export returns streaming JSON; normalize to list if needed
                 results = j.get("results") if isinstance(j, dict) else None
                 if isinstance(results, list):
                     return results
-                # Some Splunk setups return JSON per line; best-effort parse
                 try:
                     lines = [line for line in exp.text.splitlines() if line.strip()]
                     parsed = []
@@ -139,11 +144,12 @@ def _run_splunk(host: str, user: str, pwd: str, query: str, verify_tls: bool = T
                 except Exception:
                     pass
             # Fall back to create + poll pattern
-            print(f"[splunk] POST {base}/search/jobs")
+            print(f"[splunk] POST {base}/search/jobs (token={use_token})")
             r = sess.post(
                 f"{base}/search/jobs",
                 data={"search": f"search {query}", "output_mode": "json"},
-                auth=(user, pwd), timeout=30, verify=verify_param,
+                headers=headers if use_token else None,
+                auth=auth, timeout=30, verify=verify_param,
             )
             print(f"[splunk] create status={r.status_code} ct={r.headers.get('Content-Type')}")
             if r.status_code != 200:
@@ -162,7 +168,8 @@ def _run_splunk(host: str, user: str, pwd: str, query: str, verify_tls: bool = T
                 j = sess.get(
                     f"{base}/search/jobs/{sid}",
                     params={"output_mode": "json"},
-                    auth=(user, pwd), timeout=30, verify=verify_param,
+                    headers=headers if use_token else None,
+                    auth=auth, timeout=30, verify=verify_param,
                 )
                 if j.status_code != 200:
                     print(f"[splunk] poll status={j.status_code} body(head): {j.text[:200]}")
@@ -179,7 +186,8 @@ def _run_splunk(host: str, user: str, pwd: str, query: str, verify_tls: bool = T
             res = sess.get(
                 f"{base}/search/jobs/{sid}/results",
                 params={"output_mode": "json", "count": 50000},
-                auth=(user, pwd), timeout=60, verify=verify_param,
+                headers=headers if use_token else None,
+                auth=auth, timeout=60, verify=verify_param,
             )
             print(f"[splunk] results status={res.status_code} ct={res.headers.get('Content-Type')}")
             if res.status_code != 200:
@@ -269,11 +277,12 @@ def _latest_revision_from_sdk(apigee, proxy_name: str) -> Optional[str]:
 # ====================== Catalog (config/metadata) ======================
 
 def load_apigee_catalog(planet: str, org: str, env_key: str) -> List[Dict[str, Any]]:
-    env_obj = ENV_OBJ_DICT.get(env_key)
+    # Resolve environment object (Hasan-style constant mapping)
+    env_obj = ENV_OBJ_DICT.get(env_key) or ENV_OBJ_DICT.get((env_key or "").upper())
     if env_obj is None:
         raise ValueError(f"[catalog] Unknown APIGEE_ENV '{env_key}'. Available: {list(ENV_OBJ_DICT.keys())}")
 
-    # Initialize Apigee SDK
+    # Initialize Apigee SDK with env object, not the raw string
     try:
         apigee = initialize_apigee_obj(planet, org, env_obj)
     except Exception as e:
@@ -301,7 +310,11 @@ def load_apigee_catalog(planet: str, org: str, env_key: str) -> List[Dict[str, A
         deploy_env = os.getenv("APIGEE_DEPLOY_ENV", env_key)
         try:
             from .utils.apigee_utils import get_all_active_proxies_by_deployment_env
-            all_info = getattr(apigee, "get_all_info", lambda: None)() or {}
+            all_info = getattr(apigee, "mgmt", None)
+            if all_info and hasattr(all_info, "get_all_info"):
+                all_info = all_info.get_all_info()
+            else:
+                all_info = {}
             pairs = get_all_active_proxies_by_deployment_env(all_info, deploy_env)
         except Exception:
             pairs = []

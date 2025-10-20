@@ -1,6 +1,7 @@
 import logging
 import re
 import os
+import inspect
 from typing import Any, List
 
 from apigee.apigee_api import ApigeeManagement
@@ -63,32 +64,50 @@ def _normalize_planet(planet: str, selected_env) -> str:
 def initialize_apigee_obj(planet, org, selected_env):
     username = os.getenv("APIGEE_USERNAME")
     password = os.getenv("APIGEE_PASSWORD")
-    creds = {"username": username, "password": password} if username and password else {}
 
     planet = _normalize_planet(planet, selected_env)
 
-    attempts = []
-    # Object-style
-    attempts.append(("object:get_planet", lambda: ApigeeManagement(selected_env, selected_env.get_planet(planet), selected_env.get_planet(planet).get_org(org), **creds) if creds else ApigeeManagement(selected_env, selected_env.get_planet(planet), selected_env.get_planet(planet).get_org(org))))
-    # With planet
-    attempts.append(("(env, planet, org)", lambda: ApigeeManagement(selected_env, planet, org, **creds) if creds else ApigeeManagement(selected_env, planet, org)))
-    attempts.append(("(planet, org, env)", lambda: ApigeeManagement(planet, org, selected_env, **creds) if creds else ApigeeManagement(planet, org, selected_env)))
-    # Without planet
-    attempts.append(("(env, org)", lambda: ApigeeManagement(selected_env, org, **creds) if creds else ApigeeManagement(selected_env, org)))
-    attempts.append(("(org, env)", lambda: ApigeeManagement(org, selected_env, **creds) if creds else ApigeeManagement(org, selected_env)))
-    # Minimal
-    attempts.append(("(org)", lambda: ApigeeManagement(org, **creds) if creds else ApigeeManagement(org)))
-    attempts.append(("()", lambda: ApigeeManagement(**creds) if creds else ApigeeManagement()))
+    # Build kwargs based on ApigeeManagement __init__ signature
+    try:
+        sig = inspect.signature(ApigeeManagement.__init__)
+        param_names = {p for p in sig.parameters.keys() if p != "self"}
+    except Exception:
+        param_names = set()
 
-    last_exc = None
-    for label, ctor in attempts:
+    value_by_key = {
+        "environment": selected_env,
+        "env": selected_env,
+        "env_name": getattr(selected_env, "name", None) or selected_env,
+        "planet": planet,
+        "region": planet,
+        "org": org,
+        "organization": org,
+        "org_name": org,
+        "username": username,
+        "user": username,
+        "password": password,
+        "pwd": password,
+        "token": os.getenv("APIGEE_TOKEN"),
+    }
+    kwargs = {k: v for k, v in value_by_key.items() if k in param_names and v is not None}
+
+    # Try kwargs-only init first to avoid wrong positional arity
+    try:
+        if kwargs:
+            client = ApigeeManagement(**kwargs)
+        else:
+            client = ApigeeManagement()
+        log.debug(f"ApigeeManagement initialized with kwargs: {sorted(kwargs.keys())}")
+        return client
+    except Exception as e:
+        last_exc = e
+
+    # Fallback attempts (kept minimal)
+    for attempt in (lambda: ApigeeManagement(),):
         try:
-            client = ctor()
-            log.debug(f"ApigeeManagement initialized via {label}")
-            return client
+            return attempt()
         except Exception as e:
             last_exc = e
-            continue
 
     raise RuntimeError(f"Unable to initialize ApigeeManagement; last error: {last_exc}")
 
